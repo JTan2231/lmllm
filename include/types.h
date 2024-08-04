@@ -65,6 +65,7 @@ string get_layer_block(string layer_name);
 struct ModelParams {
     u32 hidden_dim;
     float ffn_dim_multiplier;
+    bf16 epsilon;
     u32 multiple_of;
     u32 num_heads;
     u32 max_seq_len;
@@ -112,7 +113,7 @@ struct Attention {
 
     ~Attention();
 
-    void forward(Tensor &x, Tensor &frequencies, Tensor &output);
+    void forward(Tensor &x, Tensor &frequencies);
     u64 memory_requirements(u32 seq_len);
 };
 
@@ -129,10 +130,40 @@ struct FeedForward {
 
     ~FeedForward();
 
-    void forward(Tensor &x, Tensor &output);
+    void forward(Tensor &x);
     u64 memory_requirements(u32 seq_len);
 };
 
 FeedForward load_feed_forward(int block_number, ModelParams params);
+
+struct RMSNorm {
+    Tensor *weight;
+    bf16 epsilon;
+
+    RMSNorm(ModelParams params, std::map<string, string> weight_map);
+
+    ~RMSNorm();
+
+    void forward(Tensor &x);
+};
+
+RMSNorm load_rms_norm(int block_number, string type, ModelParams params);
+
+struct TransformerBlock {
+    Attention *attention;
+    FeedForward *feed_forward;
+
+    RMSNorm *attention_norm;
+    RMSNorm *feed_forward_norm;
+
+    TransformerBlock(int block_number, ModelParams params);
+
+    ~TransformerBlock();
+
+    void forward(Tensor &x, Tensor &frequencies);
+    u64 memory_requirements(u32 seq_len);
+};
+
+TransformerBlock load_transformer_block(int block_number, ModelParams params);
 
 #endif // TYPES_H

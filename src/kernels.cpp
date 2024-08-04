@@ -12,6 +12,28 @@
 #include "include/logger.h"
 #include "include/types.h"
 
+#ifdef NUMERIC_DEBUG
+#define NAN_CHECK(tensor)                                                      \
+    if (nan_check(tensor)) {                                                   \
+        LOG_ERROR("NaNs in function: %s", __func__);                           \
+        throw std::runtime_error(std::string("NaNs in function: ") +           \
+                                 __func__);                                    \
+    }
+
+#define BOUND_CHECK(tensor)                                                    \
+    if (bound_check(tensor, 0, 1)) {                                           \
+        LOG_ERROR("bound breached in function: %s", __func__);                 \
+        throw std::runtime_error(std::string("bound breached in function: ") + \
+                                 __func__);                                    \
+    }
+
+#else
+#define NAN_CHECK(tensor)
+#define BOUND_CHECK(tensor)
+#endif
+
+#define CHECK_OUTPUT_NAN NAN_CHECK(out)
+
 string shape_to_string(vector<u32> &shape) {
     string s = "(";
     for (u32 i = 0; i < shape.size(); i++) {
@@ -26,7 +48,42 @@ string shape_to_string(vector<u32> &shape) {
     return s;
 }
 
-// TODO: broadcasting
+bool nan_check(Tensor &t) {
+    u64 size = 1;
+    for (u32 i = 0; i < t.shape.size(); i++) {
+        size *= t.shape[i];
+    }
+
+    for (u32 i = 0; i < size; i++) {
+        if (std::isnan(t.data[i])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool bound_check(Tensor &t, bf16 lower, bf16 upper) {
+    u64 size = 1;
+    for (u32 i = 0; i < t.shape.size(); i++) {
+        size *= t.shape[i];
+    }
+
+    for (u32 i = 0; i < size; i++) {
+        if (t.data[i] < lower || t.data[i] > upper) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool bound_check(bf16 val, bf16 lower, bf16 upper) {
+    return val < lower || val > upper;
+}
+
+bool nan_check(bf16 val) { return std::isnan(bf16_to_float(val)); }
+
 void matmul(Tensor &a, Tensor &b, Tensor &out) {
     LOG_INFO("matmul %s %s %s", shape_to_string(a.shape).c_str(),
              shape_to_string(b.shape).c_str(),
@@ -88,9 +145,9 @@ void matmul(Tensor &a, Tensor &b, Tensor &out) {
     u32 k = a.shape.back();
     u32 batch_size = out_size / (m * n);
 
-    std::vector<u32> a_strides(max_dim + 1, 1);
-    std::vector<u32> b_strides(max_dim + 1, 1);
-    for (int i = (int)max_dim - 1; i >= 0; --i) {
+    std::vector<u32> a_strides(max_dim, 1);
+    std::vector<u32> b_strides(max_dim, 1);
+    for (int i = (int)max_dim - 2; i >= 0; --i) {
         u32 _i = (u32)i;
         a_strides[_i] =
             a_strides[_i + 1] * (_i < a_shape.size() ? a_shape[_i] : 1);
@@ -99,7 +156,6 @@ void matmul(Tensor &a, Tensor &b, Tensor &out) {
     }
 
     for (u32 batch = 0; batch < batch_size; ++batch) {
-        LOG_INFO("starting batch %d", batch);
         std::vector<u32> batch_indices(max_dim, 0);
         u32 temp = batch;
         for (int i = max_dim - 1; i >= 0; --i) {
@@ -114,13 +170,13 @@ void matmul(Tensor &a, Tensor &b, Tensor &out) {
         }
 
         for (u32 i = 0; i < m; ++i) {
-            LOG_INFO("%d / %d", i, m);
             for (u32 j = 0; j < n; ++j) {
                 bf16 sum = 0;
                 for (u32 p = 0; p < k; ++p) {
                     u32 a_idx = a_offset + i * k + p;
                     u32 b_idx = b_offset + p * n + j;
-                    sum += a.data[a_idx] * b.data[b_idx];
+                    bf16 s = a.data[a_idx] * b.data[b_idx];
+                    sum += s;
                 }
 
                 out.data[batch * m * n + i * n + j] = sum;
@@ -128,7 +184,38 @@ void matmul(Tensor &a, Tensor &b, Tensor &out) {
         }
     }
 
+    NAN_CHECK(out);
+
     LOG_INFO("matmui done");
+}
+
+void add(Tensor &a, Tensor &b) {
+    if (a.shape.size() != b.shape.size()) {
+        throw std::invalid_argument(
+            "Tensors must have the same number of dimensions, got " +
+            std::to_string(a.shape.size()) + " and " +
+            std::to_string(b.shape.size()));
+    }
+
+    for (u32 i = 0; i < a.shape.size(); i++) {
+        if (a.shape[i] != b.shape[i]) {
+            throw std::invalid_argument(
+                "Tensors must have the same shape, got " +
+                std::to_string(a.shape[i]) + " and " +
+                std::to_string(b.shape[i]));
+        }
+    }
+
+    u32 size = 1;
+    for (u32 i = 0; i < a.shape.size(); i++) {
+        size *= a.shape[i];
+    }
+
+    for (u64 i = 0; i < size; i++) {
+        a.data[i] += b.data[i];
+    }
+
+    NAN_CHECK(a);
 }
 
 void sqrt(Tensor &t) {
@@ -140,6 +227,8 @@ void sqrt(Tensor &t) {
     for (u64 i = 0; i < size; i++) {
         t.data[i] = float_to_bf16(sqrt(bf16_to_float(t.data[i])));
     }
+
+    NAN_CHECK(t);
 }
 
 void divide(Tensor &a, bf16 b) {
@@ -151,6 +240,8 @@ void divide(Tensor &a, bf16 b) {
     for (u64 i = 0; i < size; i++) {
         a.data[i] /= b;
     }
+
+    NAN_CHECK(a);
 }
 
 void multiply(Tensor &a, Tensor &b) {
@@ -178,6 +269,8 @@ void multiply(Tensor &a, Tensor &b) {
     for (u64 i = 0; i < size; i++) {
         a.data[i] *= b.data[i];
     }
+
+    NAN_CHECK(a);
 }
 
 void columnwise_softmax(Tensor &t) {
@@ -196,9 +289,13 @@ void columnwise_softmax(Tensor &t) {
 
             for (u32 j = 0; j < cols; j++) {
                 t.data[b * mat_size + i * cols + j] /= sum;
+                BOUND_CHECK(t.data[b * mat_size + i * cols + j]);
             }
         }
     }
+
+    NAN_CHECK(t);
+    BOUND_CHECK(t);
 }
 
 void silu(Tensor &t) {
@@ -211,51 +308,8 @@ void silu(Tensor &t) {
         t.data[i] =
             t.data[i] * float_to_bf16(1 / (1 + exp(-bf16_to_float(t.data[i]))));
     }
-}
 
-// https://arxiv.org/pdf/1910.07467
-// see also https://github.com/meta-llama/llama/blob/main/llama/model.py#L34
-void rms_norm(Tensor &t, Tensor &weight) {
-    static const float epsilon = 1e-6;
-
-    u32 &rows = t.shape[t.shape.size() - 2];
-    u32 &cols = t.shape[t.shape.size() - 1];
-    u32 mat_size = rows * cols;
-
-    if (weight.shape[0] != rows || weight.shape[1] != cols) {
-        throw std::invalid_argument(
-            "Weight shape must match tensor shape, got " +
-            (std::to_string(weight.shape[0]) + ", " +
-             std::to_string(weight.shape[1]) + ") and (" +
-             std::to_string(rows) + ", " + std::to_string(cols)) +
-            ")");
-    }
-
-    u32 &batches = t.batches;
-
-    for (u32 b = 0; b < batches; b++) {
-        for (u32 i = 0; i < rows; i++) {
-            bf16 sum = 0;
-            for (u32 j = 0; j < cols; j++) {
-                bf16 &val = t.data[b * mat_size + i * cols + j];
-                sum += val * val;
-            }
-
-            bf16 norm =
-                float_to_bf16(1 / (sqrt(bf16_to_float(sum) / cols) + epsilon));
-
-            for (u32 j = 0; j < cols; j++) {
-                t.data[b * rows * cols + i * cols + j] *= norm;
-            }
-        }
-
-        for (u32 i = 0; i < rows; i++) {
-            for (u32 j = 0; j < cols; j++) {
-                t.data[b * mat_size + i * cols + j] *=
-                    weight.data[i * cols + j];
-            }
-        }
-    }
+    NAN_CHECK(t);
 }
 
 // TODO: this function relies on the assumption that
@@ -296,6 +350,8 @@ void apply_rotary_embeddings(Tensor &q, Tensor &k, Tensor &frequencies) {
             }
         }
     }
+
+    NAN_CHECK(q);
 }
 
 // https://github.com/meta-llama/llama/blob/main/llama/model.py#L80
@@ -338,6 +394,8 @@ Tensor get_frequency_tensor(u32 dim, u32 end) {
                 cos(bf16_to_float(frequencies.data[i * cols + j])));
         }
     }
+
+    NAN_CHECK(freq_polar);
 
     return freq_polar;
 }

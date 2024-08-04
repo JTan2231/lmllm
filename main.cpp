@@ -1,8 +1,11 @@
+#include <cmath>
 #include <iostream>
 #include <sstream>
 
 #include "include/kernels.h"
 #include "include/types.h"
+
+static const u32 seq_len = 5;
 
 int matmul_test() {
     try {
@@ -181,16 +184,14 @@ int attention_test() {
         ModelParams params = get_llama3_1_params();
         Attention attention = load_attention(1, params);
 
-        u32 seq_len = 32;
         Tensor x = random_tensor({seq_len, params.hidden_dim});
         Tensor frequencies =
             get_frequency_tensor(params.hidden_dim, params.max_seq_len);
-        Tensor output({seq_len, params.hidden_dim});
 
-        attention.forward(x, frequencies, output);
+        attention.forward(x, frequencies);
 
         cout << "output:" << endl;
-        output.print();
+        x.print();
     } catch (std::exception &e) {
         std::cerr << e.what() << endl;
         return 1;
@@ -204,14 +205,75 @@ int feedforward_test() {
         ModelParams params = get_llama3_1_params();
         FeedForward feed_forward = load_feed_forward(1, params);
 
-        u32 seq_len = 32;
         Tensor x = random_tensor({seq_len, params.hidden_dim});
-        Tensor output({seq_len, params.hidden_dim});
 
-        feed_forward.forward(x, output);
+        feed_forward.forward(x);
 
         cout << "output:" << endl;
-        output.print();
+        x.print();
+    } catch (std::exception &e) {
+        std::cerr << e.what() << endl;
+        return 1;
+    }
+
+    return 0;
+}
+
+int rms_norm_test(string type) {
+    try {
+        ModelParams params = get_llama3_1_params();
+        RMSNorm rms_norm = load_rms_norm(1, type, params);
+
+        Tensor x = random_tensor({seq_len, params.hidden_dim});
+
+        rms_norm.forward(x);
+
+        cout << "output:" << endl;
+        x.print();
+    } catch (std::exception &e) {
+        std::cerr << e.what() << endl;
+        return 1;
+    }
+
+    return 0;
+}
+
+int transformer_block_test() {
+    try {
+        ModelParams params = get_llama3_1_params();
+        TransformerBlock block = load_transformer_block(1, params);
+
+        Tensor x = random_tensor({seq_len, params.hidden_dim});
+        Tensor frequencies =
+            get_frequency_tensor(params.hidden_dim, params.max_seq_len);
+
+        block.forward(x, frequencies);
+
+        cout << "output:" << endl;
+        x.print();
+    } catch (std::exception &e) {
+        std::cerr << e.what() << endl;
+        return 1;
+    }
+
+    return 0;
+}
+
+int full_block_test() {
+    ModelParams params = get_llama3_1_params();
+
+    try {
+        for (int i = 0; i < 32; i++) {
+            cout << "block " << i << endl;
+
+            TransformerBlock block = load_transformer_block(i, params);
+
+            Tensor x = random_tensor({seq_len, params.hidden_dim});
+            Tensor frequencies =
+                get_frequency_tensor(params.hidden_dim, params.max_seq_len);
+
+            block.forward(x, frequencies);
+        }
     } catch (std::exception &e) {
         std::cerr << e.what() << endl;
         return 1;
@@ -242,7 +304,7 @@ void total_memory_requirements(u32 seq_len, ByteUnit scale) {
 }
 
 int main() {
-    total_memory_requirements(8192, ByteUnit::MB);
+    full_block_test();
 
     return 0;
 }

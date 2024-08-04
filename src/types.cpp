@@ -100,7 +100,9 @@ string get_layer_block(string layer_name) {
     return block_name;
 }
 
-ModelParams get_llama3_1_params() { return {4096, 1.3, 1024, 128, 8096}; }
+ModelParams get_llama3_1_params() {
+    return {4096, 1.3, float_to_bf16(1e-5), 1024, 128, 8096};
+}
 
 // tensors are structured as [batch_sizes..., rows, columns]
 // in memory, the column values are contiguous,
@@ -226,7 +228,7 @@ Tensor::~Tensor() {
 Tensor random_tensor(vector<u32> shape) {
     static std::random_device rd;
     static std::mt19937 gen(rd());
-    static std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+    static std::uniform_real_distribution<float> dis(-0.2f, 0.2f);
 
     Tensor t(shape);
 
@@ -236,7 +238,7 @@ Tensor random_tensor(vector<u32> shape) {
     }
 
     for (u64 i = 0; i < size; i++) {
-        t.data[i] = static_cast<bf16>(dis(gen));
+        t.data[i] = float_to_bf16(dis(gen));
     }
 
     return t;
@@ -264,7 +266,9 @@ Attention::~Attention() {
     delete this->wo;
 }
 
-void Attention::forward(Tensor &x, Tensor &frequencies, Tensor &output) {
+void Attention::forward(Tensor &x, Tensor &frequencies) {
+    LOG_INFO("begin attention forward");
+
     u32 seq_len = x.shape[0];
 
     // x.shape = [seq_len, hidden_dim]
@@ -318,7 +322,7 @@ void Attention::forward(Tensor &x, Tensor &frequencies, Tensor &output) {
     matched->transpose({1, 0, 2});
     matched->view({seq_len, hidden_dim});
 
-    matmul(*matched, *this->wo, output);
+    matmul(*matched, *this->wo, x);
     LOG_INFO("matmul matched wo done");
 
     delete xq;
@@ -326,6 +330,8 @@ void Attention::forward(Tensor &x, Tensor &frequencies, Tensor &output) {
     delete xv;
     delete scores;
     delete matched;
+
+    LOG_INFO("end attention forward");
 }
 
 // assumes a batch size of 1
@@ -402,7 +408,7 @@ FeedForward::~FeedForward() {
     delete this->w3;
 }
 
-void FeedForward::forward(Tensor &x, Tensor &output) {
+void FeedForward::forward(Tensor &x) {
     LOG_INFO("begin feedforward");
 
     Tensor *ffn1 = new Tensor({x.shape[0], this->w1->shape[1]});
@@ -413,7 +419,7 @@ void FeedForward::forward(Tensor &x, Tensor &output) {
     matmul(x, *this->w3, *ffn2);
 
     multiply(*ffn1, *ffn2);
-    matmul(*ffn1, *this->w2, output);
+    matmul(*ffn1, *this->w2, x);
 
     delete ffn1;
     delete ffn2;
@@ -472,4 +478,141 @@ FeedForward load_feed_forward(int block_number, ModelParams params) {
     LOG_INFO("Loaded feedforward block %d", block_number);
 
     return f;
+}
+
+RMSNorm::RMSNorm(ModelParams params, std::map<string, string> weight_map) {
+    this->weight = new Tensor({params.hidden_dim}, weight_map["weight"]);
+    this->epsilon = params.epsilon;
+}
+
+// https://arxiv.org/pdf/1910.07467
+// see also https://github.com/meta-llama/llama/blob/main/llama/model.py#L34
+void RMSNorm::forward(Tensor &x) {
+    LOG_INFO("begin rmsnorm forward");
+
+    u32 &rows = x.shape[x.shape.size() - 2];
+    u32 &cols = x.shape[x.shape.size() - 1];
+
+    if (this->weight->shape[0] != cols) {
+        throw std::invalid_argument(
+            "Weight must be 1D and match input column length, got " +
+            std::to_string(this->weight->shape[0]) + " and " +
+            std::to_string(cols));
+    }
+
+    for (u32 i = 0; i < rows; i++) {
+        bf16 sum = 0;
+        for (u32 j = 0; j < cols; j++) {
+            bf16 &val = x.data[i * cols + j];
+            sum += val * val;
+        }
+
+        bf16 norm = float_to_bf16(
+            1 / (sqrt(bf16_to_float(sum) / cols) + this->epsilon));
+
+        for (u32 j = 0; j < cols; j++) {
+            x.data[i * cols + j] *= norm;
+        }
+    }
+
+    for (u32 i = 0; i < rows; i++) {
+        for (u32 j = 0; j < cols; j++) {
+            x.data[i * cols + j] *= this->weight->data[j];
+        }
+    }
+
+    LOG_INFO("end rmsnorm forward");
+}
+
+RMSNorm::~RMSNorm() { delete this->weight; }
+
+RMSNorm load_rms_norm(int block_number, string type, ModelParams params) {
+    string root = Environment::getInstance().root;
+    vector<LayerMeta> layers = get_layers(root + "layers");
+    vector<LayerMeta> block_layers;
+    for (LayerMeta layer : layers) {
+        if (get_layer_block(layer.name) ==
+                "layers." + std::to_string(block_number) &&
+            layer.name.find(type + "_norm") != std::string::npos) {
+            block_layers.push_back(layer);
+        }
+    }
+
+    std::map<string, string> weight_map;
+
+    for (u32 i = 0; i < block_layers.size(); i++) {
+        LayerMeta layer = block_layers[i];
+        if (layer.name.find("_norm.weight") != std::string::npos) {
+            LOG_INFO("Found weight: %s", layer.filename.c_str());
+            weight_map["weight"] = root + "data/" + layer.filename;
+        }
+    }
+
+    if (weight_map.size() != 1) {
+        throw std::invalid_argument("Missing weights for " + type + "_norm " +
+                                    std::to_string(block_number) +
+                                    "--is everything there?");
+    }
+
+    RMSNorm r(params, weight_map);
+    LOG_INFO("Loaded rmsnorm block %d type %s", block_number, type.c_str());
+
+    return r;
+}
+
+TransformerBlock::TransformerBlock(int block_number, ModelParams params) {
+    this->attention = new Attention(load_attention(block_number, params));
+    this->feed_forward =
+        new FeedForward(load_feed_forward(block_number, params));
+
+    this->attention_norm =
+        new RMSNorm(load_rms_norm(block_number, "attention", params));
+    this->feed_forward_norm =
+        new RMSNorm(load_rms_norm(block_number, "ffn", params));
+}
+
+TransformerBlock::~TransformerBlock() {
+    delete this->attention;
+    delete this->feed_forward;
+    delete this->attention_norm;
+    delete this->feed_forward_norm;
+}
+
+void TransformerBlock::forward(Tensor &x, Tensor &frequencies) {
+    LOG_INFO("begin transformer block forward");
+
+    Tensor *intermediate = new Tensor(x.shape);
+
+    LOG_INFO("intermediate tensor created with shape %d %d",
+             intermediate->shape[0], intermediate->shape[1]);
+
+    size_t x_size = 1;
+    for (u32 i = 0; i < x.shape.size(); i++) {
+        x_size *= x.shape[i];
+    }
+
+    for (u32 i = 0; i < x_size; i++) {
+        intermediate->data[i] = x.data[i];
+    }
+
+    LOG_INFO("intermediate tensor created");
+
+    this->attention_norm->forward(*intermediate);
+    LOG_INFO("attention norm done");
+    this->attention->forward(*intermediate, frequencies);
+    LOG_INFO("attention forward done");
+    add(*intermediate, x);
+    LOG_INFO("attention residual done");
+
+    this->feed_forward_norm->forward(*intermediate);
+    this->feed_forward->forward(*intermediate);
+    add(x, *intermediate);
+
+    delete intermediate;
+
+    LOG_INFO("end transformer block forward");
+}
+
+TransformerBlock load_transformer_block(int block_number, ModelParams params) {
+    return TransformerBlock(block_number, params);
 }

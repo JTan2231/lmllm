@@ -4,13 +4,16 @@
 #include "types.h"
 
 void matmul(Tensor &a, Tensor &b, Tensor &out);
+// this is so unorganized lmfao please add some structure
+void add(Tensor &a, Tensor &b);
 void sqrt(Tensor &t);
 void divide(Tensor &a, bf16 b);
 void multiply(Tensor &a, Tensor &b);
 void columnwise_softmax(Tensor &t);
 void silu(Tensor &t);
 
-void rms_norm(Tensor &t, Tensor &weight);
+bool nan_check(Tensor &t);
+
 void apply_rotary_embeddings(Tensor &q, Tensor &k, Tensor &frequencies);
 Tensor get_frequency_tensor(u32 dim, u32 end);
 
