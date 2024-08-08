@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <sstream>
@@ -5,17 +6,75 @@
 #include "include/kernels.h"
 #include "include/types.h"
 
-static const u32 seq_len = 5;
+static const u32 seq_len = 128;
+
+#define RUN_TEST(test)                                                         \
+    {                                                                          \
+        auto start = std::chrono::high_resolution_clock::now();                \
+        int ret = test();                                                      \
+        auto end = std::chrono::high_resolution_clock::now();                  \
+        double total =                                                         \
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)  \
+                .count();                                                      \
+        cout << total / (1000 * 1000) << endl;                                 \
+        return ret;                                                            \
+    }
+
+#ifdef PRINT_TEST_OUTPUT
+#define PRINT_TEST(x)                                                          \
+    {                                                                          \
+        cout << "test " << __func__ << " results: " << endl;                   \
+        x.print();                                                             \
+    }
+#else
+#define PRINT_TEST(x)
+#endif
 
 int matmul_test() {
     try {
-        Tensor a = random_tensor({2, 4, 8});
-        Tensor b = random_tensor({1, 8, 4});
-        Tensor out = random_tensor({2, 4, 4});
+        Tensor a = random_tensor({128, 32, 128});
+        Tensor b = random_tensor({128, 128, 128});
+        Tensor out = random_tensor({128, 32, 128});
 
         matmul(a, b, out);
 
-        out.print();
+        PRINT_TEST(out);
+    } catch (std::exception &e) {
+        std::cerr << e.what() << endl;
+        return 1;
+    }
+
+    return 0;
+}
+
+int matmul_block_test() {
+    u32 batches = 2;
+    u32 r = 8;
+    u32 c = 8;
+    try {
+        Tensor a = random_tensor({batches, r, c});
+        Tensor b = random_tensor({batches, c, c});
+
+        Tensor naive_out = random_tensor({batches, r, c});
+        Tensor block_out = random_tensor({batches, r, c});
+
+        matmul_block(a, b, block_out);
+        matmul_naive(a, b, naive_out);
+
+        f32 tol = f32(0.01);
+        for (u32 i = 0; i < batches * r * c; i++) {
+            f32 diff = block_out.data[i] - naive_out.data[i];
+            if (diff > tol || diff < -tol) {
+                naive_out.print();
+                cout << "---------" << endl;
+                block_out.print();
+
+                std::cerr << "mismatch at index " << i << endl;
+                return 1;
+            }
+        }
+
+        PRINT_TEST(out);
     } catch (std::exception &e) {
         std::cerr << e.what() << endl;
         return 1;
@@ -49,22 +108,6 @@ int get_frequency_tensor_test() {
     try {
         Tensor freq_polar = get_frequency_tensor(512, 512);
         freq_polar.print();
-    } catch (std::exception &e) {
-        std::cerr << e.what() << endl;
-        return 1;
-    }
-
-    return 0;
-}
-
-int bf16_float_conversion_test() {
-    try {
-        float f = 0.503;
-        bf16 b = float_to_bf16(f);
-        cout << b << endl;
-
-        f = bf16_to_float(b);
-        cout << f << endl;
     } catch (std::exception &e) {
         std::cerr << e.what() << endl;
         return 1;
@@ -190,8 +233,7 @@ int attention_test() {
 
         attention.forward(x, frequencies);
 
-        cout << "output:" << endl;
-        x.print();
+        PRINT_TEST(x);
     } catch (std::exception &e) {
         std::cerr << e.what() << endl;
         return 1;
@@ -200,7 +242,7 @@ int attention_test() {
     return 0;
 }
 
-int feedforward_test() {
+int feed_forward_test() {
     try {
         ModelParams params = get_llama3_1_params();
         FeedForward feed_forward = load_feed_forward(1, params);
@@ -209,8 +251,7 @@ int feedforward_test() {
 
         feed_forward.forward(x);
 
-        cout << "output:" << endl;
-        x.print();
+        PRINT_TEST(x);
     } catch (std::exception &e) {
         std::cerr << e.what() << endl;
         return 1;
@@ -228,8 +269,7 @@ int rms_norm_test(string type) {
 
         rms_norm.forward(x);
 
-        cout << "output:" << endl;
-        x.print();
+        PRINT_TEST(x);
     } catch (std::exception &e) {
         std::cerr << e.what() << endl;
         return 1;
@@ -249,8 +289,7 @@ int transformer_block_test() {
 
         block.forward(x, frequencies);
 
-        cout << "output:" << endl;
-        x.print();
+        PRINT_TEST(x);
     } catch (std::exception &e) {
         std::cerr << e.what() << endl;
         return 1;
@@ -263,17 +302,19 @@ int full_block_test() {
     ModelParams params = get_llama3_1_params();
 
     try {
+        Tensor x = random_tensor({seq_len, params.hidden_dim});
+        Tensor frequencies =
+            get_frequency_tensor(params.hidden_dim, params.max_seq_len);
+
         for (int i = 0; i < 32; i++) {
             cout << "block " << i << endl;
 
             TransformerBlock block = load_transformer_block(i, params);
 
-            Tensor x = random_tensor({seq_len, params.hidden_dim});
-            Tensor frequencies =
-                get_frequency_tensor(params.hidden_dim, params.max_seq_len);
-
             block.forward(x, frequencies);
         }
+
+        PRINT_TEST(x);
     } catch (std::exception &e) {
         std::cerr << e.what() << endl;
         return 1;
@@ -303,8 +344,4 @@ void total_memory_requirements(u32 seq_len, ByteUnit scale) {
          << byte_unit_to_string(scale) << endl;
 }
 
-int main() {
-    full_block_test();
-
-    return 0;
-}
+int main() { RUN_TEST(full_block_test); }

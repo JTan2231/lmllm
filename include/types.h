@@ -13,6 +13,7 @@
 #include <vector>
 
 typedef std::bfloat16_t bf16;
+typedef float f32;
 typedef std::uint64_t u64;
 typedef std::uint32_t u32;
 typedef std::uint16_t u16;
@@ -21,6 +22,12 @@ using std::cout;
 using std::endl;
 using std::string;
 using std::vector;
+
+#ifdef BLOCK_SIZE
+const u32 block_size = BLOCK_SIZE;
+#else
+const u32 block_size = 8;
+#endif
 
 enum class ByteUnit {
     B = 1,
@@ -65,9 +72,10 @@ string get_layer_block(string layer_name);
 struct ModelParams {
     u32 hidden_dim;
     float ffn_dim_multiplier;
-    bf16 epsilon;
+    f32 epsilon;
     u32 multiple_of;
     u32 num_heads;
+    u32 kv_heads;
     u32 max_seq_len;
 };
 
@@ -79,10 +87,10 @@ ModelParams get_llama3_1_params();
 //
 // `Tensor` is a misnomer--here it's just being treated as batched matrices
 struct Tensor {
-    bf16 *data;
+    f32 *data;
     u32 batches;
     vector<u32> shape;
-    size_t mmapped;
+    u64 size;
 
     Tensor(vector<u32> shape);
     Tensor(vector<u32> shape, string filename);
@@ -92,9 +100,11 @@ struct Tensor {
     void transpose(vector<u32> permutation);
     void view(vector<u32> shape);
 
+    f32 &operator[](u32 index);
+
     ~Tensor();
 
-    inline bf16 get(u64 index) const { return this->data[index]; }
+    inline f32 get(u64 index) const { return this->data[index]; }
 };
 
 Tensor random_tensor(vector<u32> shape);
@@ -108,6 +118,7 @@ struct Attention {
 
     u32 hidden_dim;
     u32 num_heads;
+    u32 kv_heads;
 
     Attention(ModelParams params, std::map<string, string> weight_map);
 
@@ -138,7 +149,7 @@ FeedForward load_feed_forward(int block_number, ModelParams params);
 
 struct RMSNorm {
     Tensor *weight;
-    bf16 epsilon;
+    f32 epsilon;
 
     RMSNorm(ModelParams params, std::map<string, string> weight_map);
 

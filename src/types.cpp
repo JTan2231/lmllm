@@ -101,7 +101,7 @@ string get_layer_block(string layer_name) {
 }
 
 ModelParams get_llama3_1_params() {
-    return {4096, 1.3, float_to_bf16(1e-5), 1024, 128, 8096};
+    return {4096, 1.3, f32(1e-5), 1024, 32, 8, 8096};
 }
 
 // tensors are structured as [batch_sizes..., rows, columns]
@@ -121,16 +121,24 @@ Tensor::Tensor(vector<u32> shape) {
         }
     }
 
-    this->data = (bf16 *)malloc(size * sizeof(bf16));
-    this->mmapped = 0;
+    this->data = (f32 *)malloc(size * sizeof(f32));
+    for (u64 i = 0; i < size; i++) {
+        this->data[i] = 0;
+    }
+
+    this->size = size;
+
+    LOG_INFO("created tensor with size %zu", size);
 }
 
 Tensor::Tensor(vector<u32> shape, string filename) {
+    LOG_INFO("loading tensor from file %s", filename.c_str());
     this->shape = shape;
 
     this->batches = 1;
+    this->size = 1;
     for (unsigned long i = 0; i < shape.size(); i++) {
-
+        this->size *= shape[i];
         if (i < shape.size() - 2) {
             this->batches *= shape[i];
         }
@@ -138,15 +146,51 @@ Tensor::Tensor(vector<u32> shape, string filename) {
 
     int fd = open(filename.data(), O_RDONLY);
     size_t file_size = lseek(fd, 0, SEEK_END);
-    this->data = (bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    bf16 *file_data =
+        (bf16 *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+    u32 item_count = file_size / sizeof(bf16);
+    if (item_count != this->size) {
+        LOG_ERROR("File size does not match tensor size: %zu and %zu",
+                  (size_t)item_count, this->size);
+        LOG_ERROR("Filename: %s", filename.c_str());
+        LOG_ERROR("Shape:");
+        for (u32 i = 0; i < shape.size(); i++) {
+            LOG_ERROR("%d ", shape[i]);
+        }
+
+        throw std::invalid_argument("File size does not match tensor size: " +
+                                    std::to_string(item_count) + " and " +
+                                    std::to_string(this->size));
+    }
+
+    this->data = (f32 *)malloc(item_count * sizeof(f32));
+    for (u32 i = 0; i < item_count; i++) {
+        this->data[i] = bf16_to_float(file_data[i]);
+    }
 
     if (this->data == MAP_FAILED) {
         throw std::invalid_argument("Error mapping file: " + filename);
     }
 
     close(fd);
+    munmap(this->data, file_size);
 
-    this->mmapped = file_size;
+    LOG_INFO("created tensor with size %zu", size);
+    LOG_INFO("shape: ");
+    for (u32 i = 0; i < shape.size(); i++) {
+        LOG_INFO("%d ", shape[i]);
+    }
+}
+
+f32 &Tensor::operator[](u32 index) {
+    if (index >= this->size) {
+        throw std::invalid_argument(
+            "Index out of bounds: " + std::to_string(index) + " and " +
+            std::to_string(this->size));
+    }
+
+    return this->data[index];
 }
 
 void Tensor::print() {
@@ -217,13 +261,7 @@ void Tensor::view(vector<u32> shape) {
     this->shape = shape;
 }
 
-Tensor::~Tensor() {
-    if (this->mmapped) {
-        munmap(this->data, this->mmapped);
-    } else {
-        free(this->data);
-    }
-}
+Tensor::~Tensor() { free(this->data); }
 
 Tensor random_tensor(vector<u32> shape) {
     static std::random_device rd;
@@ -232,13 +270,8 @@ Tensor random_tensor(vector<u32> shape) {
 
     Tensor t(shape);
 
-    u64 size = 1;
-    for (unsigned long i = 0; i < shape.size(); i++) {
-        size *= shape[i];
-    }
-
-    for (u64 i = 0; i < size; i++) {
-        t.data[i] = float_to_bf16(dis(gen));
+    for (u64 i = 0; i < t.size; i++) {
+        t.data[i] = dis(gen);
     }
 
     return t;
@@ -246,17 +279,20 @@ Tensor random_tensor(vector<u32> shape) {
 
 // TODO: query + key caching
 Attention::Attention(ModelParams params, std::map<string, string> weight_map)
-    : hidden_dim(params.hidden_dim), num_heads(params.num_heads) {
+    : hidden_dim(params.hidden_dim), num_heads(params.num_heads),
+      kv_heads(params.kv_heads) {
     if (hidden_dim % num_heads != 0) {
         throw std::invalid_argument(
             "Hidden dimension must be divisible by number of heads, got " +
             std::to_string(hidden_dim) + " and " + std::to_string(num_heads));
     }
 
-    this->wq = new Tensor({hidden_dim, hidden_dim}, weight_map["wq"]);
-    this->wk = new Tensor({hidden_dim, hidden_dim}, weight_map["wk"]);
-    this->wv = new Tensor({hidden_dim, hidden_dim}, weight_map["wv"]);
-    this->wo = new Tensor({hidden_dim, hidden_dim}, weight_map["wo"]);
+    u32 head_dim = hidden_dim / num_heads;
+
+    this->wq = new Tensor({hidden_dim, num_heads * head_dim}, weight_map["wq"]);
+    this->wk = new Tensor({hidden_dim, kv_heads * head_dim}, weight_map["wk"]);
+    this->wv = new Tensor({hidden_dim, kv_heads * head_dim}, weight_map["wv"]);
+    this->wo = new Tensor({hidden_dim, num_heads * head_dim}, weight_map["wo"]);
 }
 
 Attention::~Attention() {
@@ -270,11 +306,12 @@ void Attention::forward(Tensor &x, Tensor &frequencies) {
     LOG_INFO("begin attention forward");
 
     u32 seq_len = x.shape[0];
+    u32 head_dim = hidden_dim / num_heads;
 
     // x.shape = [seq_len, hidden_dim]
     Tensor *xq = new Tensor(x.shape);
-    Tensor *xk = new Tensor(x.shape);
-    Tensor *xv = new Tensor(x.shape);
+    Tensor *xk = new Tensor({x.shape[0], kv_heads * head_dim});
+    Tensor *xv = new Tensor({x.shape[0], kv_heads * head_dim});
 
     LOG_INFO("new tensors xq, xk, xv created with shapes %d %d", xq->shape[0],
              xq->shape[1]);
@@ -286,30 +323,55 @@ void Attention::forward(Tensor &x, Tensor &frequencies) {
     matmul(x, *this->wv, *xv);
     LOG_INFO("matmul x wv done");
 
-    u32 head_dim = hidden_dim / num_heads;
-
     // [seq_len, num_heads, head_dim]
     xq->view({xq->shape[0], num_heads, head_dim});
-    xk->view({xk->shape[0], num_heads, head_dim});
-    xv->view({xv->shape[0], num_heads, head_dim});
+    xk->view({xk->shape[0], kv_heads, head_dim});
+    xv->view({xv->shape[0], kv_heads, head_dim});
     LOG_INFO("views set");
 
-    apply_rotary_embeddings(*xq, *xk, frequencies);
+    // keys and values need repeated to match num_heads
+    // i hope this doesn't add too much overhead
+    // pytorch is o(1), this isn't
+    Tensor *keys = new Tensor({seq_len, num_heads, head_dim});
+    Tensor *values = new Tensor({seq_len, num_heads, head_dim});
+
+    if (num_heads % kv_heads != 0) {
+        throw std::invalid_argument(
+            "Number of heads must be divisible by number of key-value heads, "
+            "got " +
+            std::to_string(num_heads) + " and " + std::to_string(kv_heads));
+    }
+
+    for (u32 s = 0; s < seq_len; s++) {
+        for (u32 r = 0; r < num_heads; r++) {
+            for (u32 c = 0; c < head_dim; c++) {
+                keys->data[s * num_heads * head_dim + r * head_dim + c] =
+                    xk->data[s * kv_heads * head_dim +
+                             (r / kv_heads) * head_dim + c];
+
+                values->data[s * num_heads * head_dim + r * head_dim + c] =
+                    xv->data[s * kv_heads * head_dim +
+                             (r / kv_heads) * head_dim + c];
+            }
+        }
+    }
+
+    apply_rotary_embeddings(*xq, *keys, frequencies);
     LOG_INFO("apply_rotary_embeddings xq done");
 
     xq->transpose({1, 0, 2});
 
-    xk->transpose({1, 0, 2}); // [num_heads, seq_len, head_dim]
-    xk->transpose({0, 2, 1});
+    keys->transpose({1, 0, 2}); // [num_heads, seq_len, head_dim]
+    keys->transpose({0, 2, 1});
 
-    xv->transpose({1, 0, 2});
+    values->transpose({1, 0, 2});
 
     LOG_INFO("transposes done");
 
-    Tensor *scores = new Tensor({xq->shape[0], xq->shape[1], xk->shape[2]});
-    matmul(*xq, *xk, *scores);
-    divide(*scores, float_to_bf16(sqrt(head_dim)));
-    LOG_INFO("matmul xq xk done");
+    Tensor *scores = new Tensor({xq->shape[0], xq->shape[1], keys->shape[2]});
+    matmul(*xq, *keys, *scores);
+    divide(*scores, sqrtf(head_dim));
+    LOG_INFO("matmul xq keys done");
 
     // TODO: masking
 
@@ -317,8 +379,8 @@ void Attention::forward(Tensor &x, Tensor &frequencies) {
     LOG_INFO("columnwise_softmax done");
 
     Tensor *matched = new Tensor({num_heads, seq_len, head_dim});
-    matmul(*scores, *xv, *matched);
-    LOG_INFO("matmul scores xv done");
+    matmul(*scores, *values, *matched);
+    LOG_INFO("matmul scores values done");
     matched->transpose({1, 0, 2});
     matched->view({seq_len, hidden_dim});
 
@@ -345,7 +407,7 @@ u64 Attention::memory_requirements(u32 seq_len) {
     // xq, xk, xv, scores, matched
     total += seq_len * hidden_dim * 5;
 
-    return total * sizeof(bf16);
+    return total * sizeof(f32);
 }
 
 Attention load_attention(int block_number, ModelParams params) {
@@ -437,7 +499,7 @@ u64 FeedForward::memory_requirements(u32 seq_len) {
     // ffn1, ffn2
     total += seq_len * w1->shape[1] * 2;
 
-    return total * sizeof(bf16);
+    return total * sizeof(f32);
 }
 
 FeedForward load_feed_forward(int block_number, ModelParams params) {
@@ -486,7 +548,8 @@ RMSNorm::RMSNorm(ModelParams params, std::map<string, string> weight_map) {
 }
 
 // https://arxiv.org/pdf/1910.07467
-// see also https://github.com/meta-llama/llama/blob/main/llama/model.py#L34
+// see also
+// https://github.com/meta-llama/llama/blob/main/llama/model.py#L34
 void RMSNorm::forward(Tensor &x) {
     LOG_INFO("begin rmsnorm forward");
 
@@ -501,14 +564,13 @@ void RMSNorm::forward(Tensor &x) {
     }
 
     for (u32 i = 0; i < rows; i++) {
-        bf16 sum = 0;
+        f32 sum = 0;
         for (u32 j = 0; j < cols; j++) {
-            bf16 &val = x.data[i * cols + j];
+            f32 &val = x.data[i * cols + j];
             sum += val * val;
         }
 
-        bf16 norm = float_to_bf16(
-            1 / (sqrt(bf16_to_float(sum) / cols) + this->epsilon));
+        f32 norm = 1 / (sqrtf(sum / cols) + this->epsilon);
 
         for (u32 j = 0; j < cols; j++) {
             x.data[i * cols + j] *= norm;
