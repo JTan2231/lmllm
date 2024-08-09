@@ -108,6 +108,7 @@ struct Tensor {
 };
 
 Tensor random_tensor(vector<u32> shape);
+Tensor ones(vector<u32> shape);
 
 // TODO: query + key caching
 struct Attention {

@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <fstream>
+#include <immintrin.h>
 #include <iostream>
 #include <map>
 #include <random>
@@ -15,6 +16,8 @@
 
 #include "include/kernels.h"
 #include "include/logger.h"
+
+const size_t ALIGNMENT = 64;
 
 string byte_unit_to_string(ByteUnit unit) {
     switch (unit) {
@@ -112,6 +115,11 @@ ModelParams get_llama3_1_params() {
 Tensor::Tensor(vector<u32> shape) {
     this->shape = shape;
 
+    // columns need to be multiples of 8 for SIMD
+    while (shape[shape.size() - 1] % 8 != 0) {
+        shape[shape.size() - 1]++;
+    }
+
     this->batches = 1;
     u64 size = 1;
     for (unsigned long i = 0; i < shape.size(); i++) {
@@ -121,7 +129,7 @@ Tensor::Tensor(vector<u32> shape) {
         }
     }
 
-    this->data = (f32 *)malloc(size * sizeof(f32));
+    this->data = static_cast<f32 *>(_mm_malloc(size * sizeof(f32), ALIGNMENT));
     for (u64 i = 0; i < size; i++) {
         this->data[i] = 0;
     }
@@ -164,7 +172,8 @@ Tensor::Tensor(vector<u32> shape, string filename) {
                                     std::to_string(this->size));
     }
 
-    this->data = (f32 *)malloc(item_count * sizeof(f32));
+    this->data =
+        static_cast<f32 *>(_mm_malloc(item_count * sizeof(f32), ALIGNMENT));
     for (u32 i = 0; i < item_count; i++) {
         this->data[i] = bf16_to_float(file_data[i]);
     }
@@ -262,6 +271,16 @@ void Tensor::view(vector<u32> shape) {
 }
 
 Tensor::~Tensor() { free(this->data); }
+
+Tensor ones(vector<u32> shape) {
+    Tensor t(shape);
+
+    for (u64 i = 0; i < t.size; i++) {
+        t.data[i] = 1;
+    }
+
+    return t;
+}
 
 Tensor random_tensor(vector<u32> shape) {
     static std::random_device rd;

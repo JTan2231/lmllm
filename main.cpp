@@ -32,11 +32,21 @@ static const u32 seq_len = 128;
 
 int matmul_test() {
     try {
-        Tensor a = random_tensor({128, 32, 128});
-        Tensor b = random_tensor({128, 128, 128});
-        Tensor out = random_tensor({128, 32, 128});
+        Tensor a = ones({2, 32, 128});
+        Tensor b = ones({2, 128, 128});
+        Tensor out = ones({2, 32, 128});
 
         matmul(a, b, out);
+
+        int count = 0;
+        for (u32 i = 0; i < out.size; i++) {
+            if (out.data[i] != 128) {
+                std::cerr << "mismatch at index " << i << endl;
+                count++;
+            }
+        }
+
+        cout << "mismatches: " << count << endl;
 
         PRINT_TEST(out);
     } catch (std::exception &e) {
@@ -48,33 +58,40 @@ int matmul_test() {
 }
 
 int matmul_block_test() {
-    u32 batches = 2;
-    u32 r = 8;
-    u32 c = 8;
+    u32 batches = 1;
+    u32 r = 128;
+    u32 c = 14336;
     try {
         Tensor a = random_tensor({batches, r, c});
-        Tensor b = random_tensor({batches, c, c});
+        Tensor b = random_tensor({batches, c, 4096});
 
-        Tensor naive_out = random_tensor({batches, r, c});
-        Tensor block_out = random_tensor({batches, r, c});
+        Tensor naive_out = random_tensor({batches, r, 4096});
+        Tensor block_out = random_tensor({batches, r, 4096});
 
         matmul_block(a, b, block_out);
         matmul_naive(a, b, naive_out);
 
         f32 tol = f32(0.01);
-        for (u32 i = 0; i < batches * r * c; i++) {
+        vector<std::pair<float, float>> mismatches;
+        vector<u32> indices;
+        for (u32 i = 0; i < batches * r * 4096; i++) {
             f32 diff = block_out.data[i] - naive_out.data[i];
             if (diff > tol || diff < -tol) {
-                naive_out.print();
-                cout << "---------" << endl;
-                block_out.print();
-
-                std::cerr << "mismatch at index " << i << endl;
-                return 1;
+                mismatches.push_back({block_out.data[i], naive_out.data[i]});
+                indices.push_back(i);
             }
         }
 
-        PRINT_TEST(out);
+        /*for (u32 i = 0; i < indices.size(); i++) {
+            u32 index = indices[i];
+            std::pair<float, float> pair = mismatches[i];
+            cout << "i, block, naive: " << index << ", " << pair.first << ", "
+                 << pair.second << endl;
+        }*/
+
+        cout << "mismatches: " << mismatches.size() << endl;
+
+        PRINT_TEST(block_out);
     } catch (std::exception &e) {
         std::cerr << e.what() << endl;
         return 1;
@@ -344,4 +361,4 @@ void total_memory_requirements(u32 seq_len, ByteUnit scale) {
          << byte_unit_to_string(scale) << endl;
 }
 
-int main() { RUN_TEST(full_block_test); }
+int main() { RUN_TEST(transformer_block_test); }

@@ -1,14 +1,16 @@
 #include "include/kernels.h"
 
-#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <mutex>
 #include <numeric>
+#include <set>
 #include <stdexcept>
 #include <stdfloat>
 #include <sys/mman.h>
+#include <thread>
 #include <unistd.h>
 
 #include "include/logger.h"
@@ -35,6 +37,33 @@
 #endif
 
 #define CHECK_OUTPUT_NAN NAN_CHECK(out)
+
+template <typename T> class ThreadSafeSet {
+  private:
+    std::set<T> set_;
+    mutable std::mutex mutex_;
+
+  public:
+    void insert(const T &value) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        set_.insert(value);
+    }
+
+    bool contains(const T &value) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return set_.find(value) != set_.end();
+    }
+
+    void erase(const T &value) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        set_.erase(value);
+    }
+
+    size_t size() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return set_.size();
+    }
+};
 
 string shape_to_string(vector<u32> &shape) {
     string s = "(";
@@ -85,39 +114,6 @@ bool bound_check(f32 val, f32 lower, f32 upper) {
 }
 
 bool nan_check(f32 val) { return std::isnan(val); }
-
-int getTotalSIMDRegisters() {
-    std::array<int, 4> cpuInfo;
-    int totalRegisters = 0;
-
-    // Execute CPUID to get CPU features
-    __asm__ __volatile__("cpuid"
-                         : "=a"(cpuInfo[0]), "=b"(cpuInfo[1]), "=c"(cpuInfo[2]),
-                           "=d"(cpuInfo[3])
-                         : "a"(1)); // Requesting basic info with EAX=1
-
-    // Check for SSE
-    if (cpuInfo[3] & (1 << 25)) {
-        totalRegisters = 8; // SSE has 8 registers (XMM0 to XMM7)
-    }
-
-    // Check for AVX
-    if (cpuInfo[2] & (1 << 28)) {
-        totalRegisters = 16; // AVX supports 16 registers (YMM0 to YMM15)
-    }
-
-    // Check for AVX-512
-    __asm__ __volatile__(
-        "cpuid"
-        : "=a"(cpuInfo[0]), "=b"(cpuInfo[1]), "=c"(cpuInfo[2]), "=d"(cpuInfo[3])
-        : "a"(7), "c"(0)); // EAX=7, ECX=0 for extended features
-
-    if (cpuInfo[1] & (1 << 16)) {
-        totalRegisters = 32; // AVX-512 supports 32 registers (ZMM0 to ZMM31)
-    }
-
-    return totalRegisters; // Return total number of SIMD registers available
-}
 
 void matmul_naive(Tensor &a, Tensor &b, Tensor &out) {
     std::vector<u32> a_shape(a.shape.begin(), a.shape.end() - 2);
@@ -240,6 +236,17 @@ void matmul_block(Tensor &a, Tensor &b, Tensor &out) {
             b_strides[_i + 1] * (_i < b_shape.size() ? b_shape[_i] : 1);
     }
 
+    u32 num_threads = std::thread::hardware_concurrency();
+    vector<std::thread> threads;
+    threads.reserve(num_threads);
+
+    while (batch_size % num_threads != 0 &&
+           (bc / num_threads) % block_size != 0) {
+        num_threads--;
+    }
+
+    u32 n_cols = bc / num_threads;
+    u32 thread_block_size = std::min(n_cols, block_size);
     for (u32 batch = 0; batch < batch_size; ++batch) {
         std::vector<u32> batch_indices(max_dim, 0);
         u32 temp = batch;
@@ -257,37 +264,59 @@ void matmul_block(Tensor &a, Tensor &b, Tensor &out) {
         a_offset *= ar * ac;
         b_offset *= br * bc;
 
-        for (u32 col_chunk = 0; col_chunk < bc; col_chunk += block_size) {
-            for (u32 row = 0; row < ar; row++) {
-                for (u32 tile = 0; tile < br; tile += block_size) {
-                    for (u32 tile_row = 0;
-                         tile_row < std::min(ar - tile, block_size);
-                         tile_row++) {
-                        for (u32 idx = 0;
-                             idx < std::min(bc - col_chunk, block_size);
-                             idx += 8) {
-                            __m256 a_vec = _mm256_loadu_ps(
-                                &a.data[a_offset + row * ac + tile + tile_row]);
-                            __m256 b_vec = _mm256_loadu_ps(
-                                &b.data[b_offset + tile * bc + tile_row * bc +
-                                        col_chunk + idx]);
+        u32 start_col = 0;
+        for (u32 i = 0; i < num_threads; i++) {
+            u32 end_col = start_col + n_cols;
+            threads.emplace_back([=, &a, &b, &out]() {
+                for (u32 col_chunk = start_col; col_chunk < end_col;
+                     col_chunk += thread_block_size) {
+                    for (u32 row = 0; row < ar; row++) {
+                        for (u32 tile = 0; tile < br;
+                             tile += thread_block_size) {
+                            for (u32 tile_row = 0;
+                                 tile_row <
+                                 std::min(br - tile, thread_block_size);
+                                 tile_row++) {
+                                u32 a_index =
+                                    a_offset + row * ac + tile + tile_row;
+                                __m256 a_vec =
+                                    _mm256_broadcast_ss(&a.data[a_index]);
 
-                            __m256 prod = _mm256_mul_ps(a_vec, b_vec);
+                                for (u32 idx = 0;
+                                     idx < std::min(bc - col_chunk,
+                                                    thread_block_size);
+                                     idx += 8) {
+                                    u32 b_index = b_offset + tile * bc +
+                                                  tile_row * bc + col_chunk +
+                                                  idx;
+                                    u32 out_index = batch * ar * bc + row * bc +
+                                                    col_chunk + idx;
 
-                            __m256 out_vec = _mm256_loadu_ps(
-                                &out.data[batch * ar * bc + row * bc +
-                                          col_chunk + idx]);
+                                    __m256 b_vec =
+                                        _mm256_loadu_ps(&b.data[b_index]);
+                                    __m256 out_vec =
+                                        _mm256_loadu_ps(&out.data[out_index]);
 
-                            out_vec = _mm256_add_ps(out_vec, prod);
-                            _mm256_storeu_ps(
-                                &out.data[batch * ar * bc + row * bc +
-                                          col_chunk + idx],
-                                out_vec);
+                                    out_vec =
+                                        _mm256_fmadd_ps(a_vec, b_vec, out_vec);
+
+                                    _mm256_storeu_ps(&out.data[out_index],
+                                                     out_vec);
+                                }
+                            }
                         }
                     }
                 }
-            }
+            });
+
+            start_col += n_cols;
         }
+
+        for (auto &thread : threads) {
+            thread.join();
+        }
+
+        threads.clear();
     }
 }
 
@@ -465,17 +494,18 @@ void apply_rotary_embeddings(Tensor &q, Tensor &k, Tensor &frequencies) {
     // q.shape = [seq_len, num_heads, hidden_size / num_heads]
     // k.shape = [seq_len, num_heads, hidden_size / num_heads]
     //
-    // but the above are going to be treating as if they're polar coordinates
-    // making their shapes essentially
-    // [seq_len, num_heads, (hidden_size / num_heads) / 2, 2]
-    // (but they won't be represented like that here)
+    // but the above are going to be treating as if they're polar
+    // coordinates making their shapes essentially [seq_len, num_heads,
+    // (hidden_size / num_heads) / 2, 2] (but they won't be represented
+    // like that here)
     //
     // and so the frequencies shape
     // frequencies.shape = [seq_len, (hidden_size / num_heads) / 2, 2]
     // will need to be broadcasted like so
     // [seq_len, 1, (hidden_size / num_heads) / 2, 2]
 
-    // this assumes that q.batches == k.batches and frequencies.batches == 1
+    // this assumes that q.batches == k.batches and frequencies.batches
+    // == 1
 
     u32 &rows = q.shape[q.shape.size() - 2];
     u32 &cols = q.shape[q.shape.size() - 1];
